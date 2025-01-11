@@ -1,7 +1,7 @@
 import importlib
 import pathlib
 import pkgutil
-import sys
+import types
 from typing import Iterator
 
 
@@ -15,11 +15,11 @@ def import_all_modules_under_pkg(root_package: str) -> None:
         importlib.import_module(name)
 
 
-def get_all_python_files_in_dir(root_dir: str) -> list[pathlib.Path]:
+def get_all_python_files_in_dir(root_dir: str) -> Iterator[pathlib.Path]:
     root = pathlib.Path(root_dir)
-    return [
+    return (
         path for path in root.rglob("*.py") if not str(path).endswith("__init__.py")
-    ]
+    )
 
 
 def get_all_subclasses_of(cls: type) -> Iterator[type]:
@@ -49,42 +49,34 @@ from contextlib import contextmanager
 
 class DependencyAnalyzer(ast.NodeVisitor):
     known_subclasses: set[str]
-    current_class: str | None
+    _current_class: str | None
     discovered_classes: defaultdict[str, set[str]]
 
     def __init__(self, known_subclasses: set[str]):
         super().__init__()
         self.known_subclasses = known_subclasses
-        self.current_class = None
+        self._current_class = None
         self.discovered_classes = defaultdict(set)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         if node.name not in self.known_subclasses:
             self.generic_visit(node)
         else:
-            # TODO: Switch to context manager
-            # Enter
-            old_class = self.current_class
-            self.current_class = node.name
-
-            # Visit the internals of the class
-            self.generic_visit(node)
-
-            # Exit
-            self.current_class = old_class
+            with self.__save_current_class_context(node):
+                self.generic_visit(node)
 
     def visit_Call(self, node: ast.Call) -> None:
         """
         Called whenever we see a function or constructor call: e.g., SomeConfig(...).
         We want to see if that 'SomeConfig' is in known_configs.
         """
-        if self.current_class is not None:
+        if self._current_class is not None:
             self.__handle_recognized_class(node)
 
         self.generic_visit(node)
 
     def __handle_recognized_class(self, node: ast.Call) -> None:
-        if self.current_class is None:
+        if self._current_class is None:
             raise ValueError()
 
         called_name: str
@@ -97,55 +89,59 @@ class DependencyAnalyzer(ast.NodeVisitor):
             return
 
         if called_name in self.known_subclasses:
-            self.discovered_classes[self.current_class].add(called_name)
+            self.discovered_classes[self._current_class].add(called_name)
 
-    # @contextmanager
-    # def __save_current_class_context(self) -> None:
-    #     pass
+    @contextmanager
+    def __save_current_class_context(self, node: ast.ClassDef) -> Iterator[None]:
+        old_class = self._current_class
+        self._current_class = node.name
+
+        yield
+
+        self._current_class = old_class
 
     @classmethod
     def analyze_dependencies_in_file(
-        cls, filename: pathlib.Path, known_configs: set[str]
+        cls, file_path: pathlib.Path, known_configs: set[str]
     ) -> dict[str, set[str]]:
         """
         Parse the given Python file, return discovered references in a dict.
         """
-        with open(filename) as f:
+        with open(file_path) as f:
             source = f.read()
 
-        tree = ast.parse(source, filename=filename)
+        tree = ast.parse(source, filename=file_path)
         analyzer = cls(known_configs)
         analyzer.visit(tree)
         return analyzer.discovered_classes
 
     @classmethod
     def analyze_dependencies(
-        cls, root_pkg_to_scan: str, baseclass: type
+        cls, root_pkg_to_scan: types.ModuleType, baseclass: type
     ) -> dict[str, set[str]]:
-        # To make sure all the available subclasses are loaded
-        # TODO: Figure out why pkg1 works but root_pkg_to_scan doesn't
-        import_all_modules_under_pkg("pkg1")
+        import_all_modules_under_pkg(root_pkg_to_scan.__name__)
 
         cls_map = build_classname_map(baseclass)
         subclasses_names = set(cls_map.keys())
 
-        py_files = get_all_python_files_in_dir(root_pkg_to_scan)
-
         overall = defaultdict(set)
-        for f in py_files:
+        package_path = root_pkg_to_scan.__path__[0]
+
+        for file_path in get_all_python_files_in_dir(package_path):
             discovered = DependencyAnalyzer.analyze_dependencies_in_file(
-                f, subclasses_names
+                file_path, subclasses_names
             )
             for cls_name, cls_dependencies_names in discovered.items():
                 overall[cls_name].update(cls_dependencies_names)
+
         return overall
 
 
 def main():
-    root_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), "pkg1")
+    import pkg1
 
     discovered = DependencyAnalyzer.analyze_dependencies(
-        root_pkg_to_scan=root_dir, baseclass=BaseConfig
+        root_pkg_to_scan=pkg1, baseclass=BaseConfig
     )
     pass
 
